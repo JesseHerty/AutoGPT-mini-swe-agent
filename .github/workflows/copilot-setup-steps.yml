@@ -1,0 +1,345 @@
+name: "Copilot Setup Steps"
+
+# Automatically run the setup steps when they are changed to allow for easy validation, and
+# allow manual testing through the repository's "Actions" tab
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+
+
+jobs:
+  copilot-setup-steps:
+    name: Prepare GitHub Copilot development environment
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Free disk space and prune Docker resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          docker system prune -af || true
+          docker builder prune -af || true
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Poetry version from backend lockfile
+        working-directory: autogpt_platform/backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          poetry_version="$(python "$GITHUB_WORKSPACE/.github/workflows/scripts/get_package_version_from_lockfile.py" poetry poetry.lock)"
+          python -m pip install --upgrade pip
+          python -m pip install "poetry==${poetry_version}"
+          poetry --version
+
+      - name: Regenerate and verify backend lockfile
+        working-directory: autogpt_platform/backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp poetry.lock /tmp/poetry.lock.committed
+          if ! poetry lock; then
+            echo "::error::Poetry failed to regenerate poetry.lock."
+            cp /tmp/poetry.lock.committed poetry.lock
+            exit 1
+          fi
+
+          set +e
+          python - <<'PY'
+          from pathlib import Path
+
+
+          def normalized_lines(path: str) -> list[str]:
+              return [
+                  line.rstrip()
+                  for line in Path(path).read_text().splitlines()
+                  if line.strip() and not line.lstrip().startswith("#")
+              ]
+
+
+          committed = normalized_lines("/tmp/poetry.lock.committed")
+          generated = normalized_lines("poetry.lock")
+          raise SystemExit(0 if committed == generated else 1)
+          PY
+          lock_diff_status=$?
+          set -e
+
+          if [ "$lock_diff_status" -ne 0 ]; then
+            echo "::warning::Regenerated poetry.lock differs from the committed lockfile; restoring the committed lockfile and continuing."
+          else
+            echo "Lockfile is unchanged apart from comments."
+          fi
+          cp /tmp/poetry.lock.committed poetry.lock
+
+      - name: Install backend dependencies and generate Prisma artifacts
+        working-directory: autogpt_platform/backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          poetry install --no-interaction --no-ansi
+          poetry run prisma generate
+          poetry run gen-prisma-stub
+
+      - name: Set up pnpm 10.20.0
+        uses: pnpm/action-setup@v4
+        with:
+          version: '10.20.0'
+          run_install: false
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: autogpt_platform/frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies from lockfile
+        working-directory: autogpt_platform/frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+
+      - name: Create local development environment files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -n autogpt_platform/.env.default autogpt_platform/.env
+          cp -n autogpt_platform/backend/.env.default autogpt_platform/backend/.env
+          cp -n autogpt_platform/frontend/.env.default autogpt_platform/frontend/.env
+
+      - name: Restore cached dependency Docker image archives
+        id: docker-image-cache
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/copilot-docker-images
+          key: copilot-docker-images-v1-${{ runner.os }}-${{ hashFiles('autogpt_platform/docker-compose.yml', 'autogpt_platform/docker-compose.platform.yml', 'autogpt_platform/db/docker/docker-compose.yml') }}
+          restore-keys: |
+            copilot-docker-images-v1-${{ runner.os }}-
+
+      - name: Load cached Docker images or pull dependency images in parallel
+        id: prepare-images
+        shell: bash
+        run: |
+          set -uo pipefail
+          image_cache_dir=/tmp/copilot-docker-images
+          mkdir -p "$image_cache_dir"
+
+          images=(
+            "redis:7"
+            "rabbitmq:4.1.4"
+            "clamav/clamav-debian:latest"
+            "busybox:latest"
+            "kong:2.8.1"
+            "supabase/gotrue:v2.170.0"
+            "supabase/postgres:15.8.1.049"
+            "supabase/postgres-meta:v0.86.1"
+            "supabase/studio:20250224-d10db0f"
+            "falkordb/falkordb:latest"
+          )
+
+          archive_for() {
+            printf '%s' "$1" | tr '/:' '__'
+          }
+
+          archive_count=0
+          for image in "${images[@]}"; do
+            archive="$image_cache_dir/$(archive_for "$image").tar"
+            if [[ -f "$archive" ]]; then
+              archive_count=$((archive_count + 1))
+            fi
+          done
+
+          if (( archive_count > 0 )); then
+            echo "Found ${archive_count} cached image archive(s); loading only the archives that exist."
+            for image in "${images[@]}"; do
+              archive="$image_cache_dir/$(archive_for "$image").tar"
+              if [[ -f "$archive" ]]; then
+                (
+                  if docker load -i "$archive"; then
+                    echo "Loaded Docker image ${image} from $(basename "$archive")."
+                  else
+                    echo "::warning::Failed to load cached Docker image archive $(basename "$archive")."
+                  fi
+                ) &
+              fi
+            done
+            wait
+          else
+            echo "No cached image archives found; pulling the complete dependency image set in parallel."
+            for image in "${images[@]}"; do
+              (
+                if docker pull "$image"; then
+                  echo "Pulled Docker image ${image}."
+                else
+                  echo "::warning::Failed to pull Docker image ${image}; continuing."
+                fi
+              ) &
+            done
+            wait
+
+            for image in "${images[@]}"; do
+              archive="$image_cache_dir/$(archive_for "$image").tar"
+              (
+                if docker save "$image" -o "$archive"; then
+                  echo "Saved Docker image ${image} to $(basename "$archive")."
+                else
+                  rm -f "$archive"
+                  echo "::warning::Failed to save Docker image archive $(basename "$archive")."
+                fi
+              ) &
+            done
+            wait
+          fi
+
+          archive_count="$(find "$image_cache_dir" -maxdepth 1 -type f -name '*.tar' | wc -l | tr -d '[:space:]')"
+          echo "archive_count=${archive_count}" >> "$GITHUB_OUTPUT"
+
+      - name: Save dependency Docker image archives on main or development branches
+        if: >-
+          github.event_name != 'pull_request' &&
+          steps.docker-image-cache.outputs.cache-hit != 'true' &&
+          steps.prepare-images.outputs.archive_count != '0' &&
+          (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/develop')
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/copilot-docker-images
+          key: copilot-docker-images-v1-${{ runner.os }}-${{ hashFiles('autogpt_platform/docker-compose.yml', 'autogpt_platform/docker-compose.platform.yml', 'autogpt_platform/db/docker/docker-compose.yml') }}
+
+      - name: Build and load migration service image with GitHub Actions cache
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: autogpt_platform/backend/Dockerfile
+          target: migrate
+          pull: true
+          load: true
+          tags: autogpt_platform-backend:migrate
+          cache-from: type=gha,scope=copilot-setup-migrate
+          cache-to: type=gha,mode=max,scope=copilot-setup-migrate
+
+      - name: Start local Docker Compose dependency services
+        working-directory: autogpt_platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          override_file=/tmp/copilot-compose.override.yml
+          cat > "$override_file" <<'COMPOSE_EOF'
+          services:
+            migrate:
+              image: autogpt_platform-backend:migrate
+          COMPOSE_EOF
+          docker compose -f docker-compose.yml -f "$override_file" --profile local up -d --no-build deps
+
+      - name: Check database readiness and migration status
+        continue-on-error: true
+        working-directory: autogpt_platform
+        shell: bash
+        run: |
+          set +e
+          compose=(docker compose -f docker-compose.yml -f /tmp/copilot-compose.override.yml)
+
+          db_ready=0
+          for attempt in $(seq 1 60); do
+            if "${compose[@]}" exec -T db pg_isready -U postgres >/dev/null 2>&1; then
+              db_ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$db_ready" -eq 1 ]; then
+            echo "Database is accepting connections."
+          else
+            echo "::warning::Database did not become ready within 120 seconds; continuing."
+          fi
+
+          migrate_id="$("${compose[@]}" ps -a -q migrate 2>/dev/null | head -n 1)"
+          if [ -z "$migrate_id" ]; then
+            echo "::warning::Could not determine migration container state; continuing."
+          else
+            migration_status=""
+            for attempt in $(seq 1 60); do
+              migration_status="$(docker inspect -f '{{.State.Status}}' "$migrate_id" 2>/dev/null)"
+              if [ "$migration_status" = "exited" ]; then
+                break
+              fi
+              sleep 2
+            done
+            migration_exit_code="$(docker inspect -f '{{.State.ExitCode}}' "$migrate_id" 2>/dev/null)"
+            echo "Migration container: status=${migration_status:-unknown}, exit_code=${migration_exit_code:-unknown}"
+            if [ "$migration_status" = "exited" ] && [ "$migration_exit_code" = "0" ]; then
+              echo "Database migrations completed successfully."
+            else
+              echo "::warning::Migration did not complete successfully or its state could not be confirmed; continuing."
+            fi
+          fi
+
+          "${compose[@]}" ps -a || echo "::warning::Could not display dependency service status; continuing."
+          "${compose[@]}" logs --no-color --tail=200 db migrate || echo "::warning::Could not collect database or migration logs; continuing."
+          exit 0
+
+      - name: Verify core development tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          python --version
+          poetry --version
+          node --version
+          pnpm --version
+          docker --version
+          docker compose version
+          echo "Development environment information:"
+          uname -a
+          df -h /
+
+      - name: Check GitHub CLI
+        continue-on-error: true
+        shell: bash
+        run: gh --version || echo "::warning::GitHub CLI check failed; continuing."
+
+      - name: Show dependency service status
+        continue-on-error: true
+        working-directory: autogpt_platform
+        shell: bash
+        run: docker compose -f docker-compose.yml -f /tmp/copilot-compose.override.yml ps -a || echo "::warning::Unable to display dependency service status; continuing."
+
+      - name: Show dependency summary
+        continue-on-error: true
+        shell: bash
+        run: |
+          (cd autogpt_platform/backend && poetry show --no-ansi | sed -n '1,100p') || echo "::warning::Unable to display backend dependency summary; continuing."
+          (cd autogpt_platform/frontend && pnpm list --depth=0 | sed -n '1,100p') || echo "::warning::Unable to display frontend dependency summary; continuing."
+
+      - name: List development environment files
+        continue-on-error: true
+        shell: bash
+        run: ls -la autogpt_platform/.env autogpt_platform/backend/.env autogpt_platform/frontend/.env || echo "::warning::Unable to list development environment files; continuing."
