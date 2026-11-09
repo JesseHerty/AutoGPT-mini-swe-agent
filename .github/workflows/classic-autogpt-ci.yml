@@ -1,0 +1,111 @@
+name: Classic - AutoGPT CI
+
+on:
+  push:
+    branches: [ master, dev, ci-test* ]
+    paths:
+      - '.github/workflows/classic-autogpt-ci.yml'
+      - 'classic/original_autogpt/**'
+      - 'classic/direct_benchmark/**'
+      - 'classic/forge/**'
+      - 'classic/pyproject.toml'
+      - 'classic/poetry.lock'
+  pull_request:
+    branches: [ master, dev, release-* ]
+    paths:
+      - '.github/workflows/classic-autogpt-ci.yml'
+      - 'classic/original_autogpt/**'
+      - 'classic/direct_benchmark/**'
+      - 'classic/forge/**'
+      - 'classic/pyproject.toml'
+      - 'classic/poetry.lock'
+
+concurrency:
+  group: ${{ format('classic-autogpt-ci-{0}', github.head_ref && format('{0}-{1}', github.event_name, github.event.pull_request.number) || github.sha) }}
+  cancel-in-progress: ${{ startsWith(github.event_name, 'pull_request') }}
+
+defaults:
+  run:
+    shell: bash
+    working-directory: classic
+
+
+jobs:
+  test:
+    name: Test Classic AutoGPT
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      minio:
+        image: minio/minio
+        env:
+          MINIO_ACCESS_KEY: minio
+          MINIO_SECRET_KEY: minio123
+        ports:
+          - 9000:9000
+        command: server /data
+    env:
+      S3_ENDPOINT_URL: http://localhost:9000
+      AWS_ACCESS_KEY_ID: minio
+      AWS_SECRET_ACCESS_KEY: minio123
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        run: python -m pip install poetry==2.3.4
+
+      - name: Configure Git identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Install project dependencies
+        run: poetry install --no-interaction --no-ansi
+
+      - name: Run unit and integration tests
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -o pipefail
+          poetry run pytest \
+            -n auto \
+            --cov=forge \
+            --cov=autogpt \
+            --cov-branch \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --junitxml=junit.xml \
+            2>&1 | tee pytest.log
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: classic/junit.xml
+
+      - name: Upload coverage reports to Codecov
+        if: ${{ success() }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: classic/coverage.xml
+          flags: autogpt-agent
+          name: AutoGPT
+
+      - name: Upload test logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pytest-logs
+          path: classic/pytest.log
