@@ -1,0 +1,70 @@
+name: Block Documentation Sync Check
+
+on:
+  push:
+    branches: [master, dev]
+    paths:
+      - "autogpt_platform/backend/backend/blocks/**"
+      - "docs/integrations/**"
+      - "autogpt_platform/backend/scripts/generate_block_docs.py"
+      - ".github/workflows/docs-block-sync.yml"
+  pull_request:
+    branches: [master, dev]
+    paths:
+      - "autogpt_platform/backend/backend/blocks/**"
+      - "docs/integrations/**"
+      - "autogpt_platform/backend/scripts/generate_block_docs.py"
+      - ".github/workflows/docs-block-sync.yml"
+
+
+jobs:
+  check-docs-sync:
+    name: Check Block Documentation Sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry from backend lockfile
+        run: |
+          POETRY_VERSION="$(python .github/workflows/scripts/get_package_version_from_lockfile.py poetry autogpt_platform/backend/poetry.lock)"
+          python -m pip install "poetry==${POETRY_VERSION}"
+
+      - name: Install backend dependencies
+        working-directory: autogpt_platform/backend
+        run: poetry install --only main --no-root
+
+      - name: Generate Prisma client
+        working-directory: autogpt_platform/backend
+        run: poetry run prisma generate
+
+      - name: Check block documentation sync
+        working-directory: autogpt_platform/backend
+        run: poetry run python scripts/generate_block_docs.py --check
+
+      - name: Regenerate block documentation for diagnosis
+        id: regenerate_docs
+        if: ${{ failure() }}
+        working-directory: autogpt_platform/backend
+        run: poetry run python scripts/generate_block_docs.py
+
+      - name: Show generated documentation diff
+        if: ${{ failure() && steps.regenerate_docs.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          git diff --stat -- docs/integrations
+          git diff -- docs/integrations
+
+      - name: Show local documentation fix instructions
+        if: ${{ failure() }}
+        run: |
+          echo "::error title=Block documentation sync failed::The block documentation check did not pass."
+          echo "To reproduce and fix locally:"
+          echo "  cd autogpt_platform/backend"
+          echo "  poetry run python scripts/generate_block_docs.py"
+          echo "Then commit the regenerated files under docs/integrations/."
