@@ -1,0 +1,95 @@
+name: Classic - Python checks
+
+on:
+  push:
+    branches: [ master, dev, ci-test* ]
+    paths:
+      - '.github/workflows/classic-python-checks-ci.yml'
+      - 'classic/original_autogpt/**'
+      - 'classic/forge/**'
+      - 'classic/direct_benchmark/**'
+      - 'classic/pyproject.toml'
+      - 'classic/poetry.lock'
+      - '**.py'
+      - '!classic/forge/tests/vcr_cassettes'
+  pull_request:
+    branches: [ master, dev, release-* ]
+    paths:
+      - '.github/workflows/classic-python-checks-ci.yml'
+      - 'classic/original_autogpt/**'
+      - 'classic/forge/**'
+      - 'classic/direct_benchmark/**'
+      - 'classic/pyproject.toml'
+      - 'classic/poetry.lock'
+      - '**.py'
+      - '!classic/forge/tests/vcr_cassettes'
+
+concurrency:
+  group: ${{ format('classic-python-checks-ci-{0}', github.head_ref && format('{0}-{1}', github.event_name, github.event.pull_request.number) || github.sha) }}
+  cancel-in-progress: ${{ startsWith(github.event_name, 'pull_request') }}
+
+defaults:
+  run:
+    shell: bash
+    working-directory: classic
+
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: 2.3.4
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Install project dependencies
+        run: poetry install
+
+      - name: Check import sorting
+        run: poetry run isort --check-only .
+
+      - name: Check code formatting
+        if: ${{ success() || failure() }}
+        run: poetry run black --check .
+
+      - name: Check static code style
+        if: ${{ success() || failure() }}
+        run: poetry run flake8
+
+  types:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: 2.3.4
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Install project dependencies
+        run: poetry install
+
+      - name: Check types with Pyright
+        if: ${{ success() || failure() }}
+        run: poetry run pyright
