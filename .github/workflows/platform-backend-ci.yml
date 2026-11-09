@@ -1,0 +1,362 @@
+name: AutoGPT Platform - Backend CI
+
+on:
+  push:
+    branches: [master, dev, ci-test*]
+    paths:
+      - ".github/workflows/platform-backend-ci.yml"
+      - ".github/workflows/scripts/get_package_version_from_lockfile.py"
+      - "autogpt_platform/backend/**"
+      - "autogpt_platform/autogpt_libs/**"
+  pull_request:
+    branches: [master, dev, release-*]
+    paths:
+      - ".github/workflows/platform-backend-ci.yml"
+      - ".github/workflows/scripts/get_package_version_from_lockfile.py"
+      - "autogpt_platform/backend/**"
+      - "autogpt_platform/autogpt_libs/**"
+  merge_group:
+
+concurrency:
+  group: ${{ format('backend-ci-{0}', github.head_ref && format('{0}-{1}', github.event_name, github.event.pull_request.number) || github.sha) }}
+  cancel-in-progress: ${{ startsWith(github.event_name, 'pull_request') }}
+
+defaults:
+  run:
+    shell: bash
+    working-directory: autogpt_platform/backend
+
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry from lockfile
+        run: |
+          POETRY_VERSION="$(python "${{ github.workspace }}/.github/workflows/scripts/get_package_version_from_lockfile.py" poetry poetry.lock)"
+          echo "Installing Poetry ${POETRY_VERSION}"
+          python -m pip install --upgrade pip
+          python -m pip install "poetry==${POETRY_VERSION}"
+
+      - name: Install project dependencies
+        run: poetry install --no-interaction
+
+      - name: Run static checks without Pyright
+        run: poetry run lint --skip-pyright
+
+  type-check:
+    name: Type Check (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Poetry from lockfile
+        run: |
+          POETRY_VERSION="$(python "${{ github.workspace }}/.github/workflows/scripts/get_package_version_from_lockfile.py" poetry poetry.lock)"
+          echo "Installing Poetry ${POETRY_VERSION}"
+          python -m pip install --upgrade pip
+          python -m pip install "poetry==${POETRY_VERSION}"
+
+      - name: Install project dependencies
+        run: poetry install --no-interaction
+
+      - name: Generate Prisma client and type stubs
+        run: |
+          poetry run prisma generate
+          poetry run gen-prisma-stub
+
+      - name: Run Pyright for Python ${{ matrix.python-version }}
+        run: poetry run pyright --pythonversion "${{ matrix.python-version }}" backend ../autogpt_libs
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    env:
+      E2E_REDIS_CLUSTER_RESTART: "1"
+      ENCRYPTION_KEY: "dvziYgz0KSK8FENhju0ZYi8-fRTfAdlz6YLhdB_jhNw="
+      UNSUBSCRIBE_SECRET_KEY: "HlP8ivStJjmbf6NKi78m_3FnOogut0t5ckzjsIqeaio="
+      RABBITMQ_DEFAULT_USER: "rabbitmq_user_default"
+      RABBITMQ_DEFAULT_PASS: "k0VMxyIJF9S35f3x2uaw5IWAl6Y536O7"
+      RABBITMQ_HOST: "localhost"
+      RABBITMQ_PORT: "5672"
+      REDIS_HOST: "localhost"
+      REDIS_PORT: "17000"
+      REDIS_CLUSTER_HOST: "localhost"
+      REDIS_CLUSTER_PORT: "17000"
+      REDIS_USE_ANNOUNCED_ADDRESS: "false"
+      GRAPHITI_FALKORDB_HOST: "localhost"
+      GRAPHITI_FALKORDB_PORT: "6380"
+      GRAPHITI_FALKORDB_PASSWORD: "local-dev-password"
+      CLAMAV_SERVICE_HOST: "localhost"
+      CLAMAV_SERVICE_PORT: "3310"
+      CLAMAV_SERVICE_ENABLED: "true"
+      CLAMAV_SERVICE_TIMEOUT: "60"
+      CLAMAV_MAX_CONCURRENCY: "10"
+      CLAMAV_MARK_FAILED_SCANS_AS_CLEAN: "false"
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Select Poetry version
+        id: poetry
+        run: |
+          CURRENT_VERSION="$(python "${{ github.workspace }}/.github/workflows/scripts/get_package_version_from_lockfile.py" poetry poetry.lock)"
+          BASE_VERSION=""
+          if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "merge_group" ]]; then
+            BASE_REF="${{ github.base_ref }}"
+            if [[ -z "${BASE_REF}" ]]; then
+              BASE_REF="${{ github.event.merge_group.base_ref }}"
+            fi
+            BASE_REF="${BASE_REF#refs/heads/}"
+            if [[ -n "${BASE_REF}" ]]; then
+              git fetch origin "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" --depth=1
+              BASE_VERSION="$(git show "origin/${BASE_REF}:autogpt_platform/backend/poetry.lock" | python "${{ github.workspace }}/.github/workflows/scripts/get_package_version_from_lockfile.py" poetry -)"
+            fi
+          fi
+          if [[ -n "${BASE_VERSION}" ]]; then
+            POETRY_VERSION="$(printf '%s\n%s\n' "${CURRENT_VERSION}" "${BASE_VERSION}" | sort -Vr | head -n1)"
+          else
+            POETRY_VERSION="${CURRENT_VERSION}"
+          fi
+          echo "Current lockfile Poetry version: ${CURRENT_VERSION}"
+          echo "Base branch Poetry version: ${BASE_VERSION:-none}"
+          echo "Selected Poetry version: ${POETRY_VERSION}"
+          echo "version=${POETRY_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install selected Poetry version
+        run: |
+          echo "Installing Poetry ${{ steps.poetry.outputs.version }}"
+          python -m pip install --upgrade pip
+          python -m pip install "poetry==${{ steps.poetry.outputs.version }}"
+
+      - name: Validate regenerated Poetry lockfile
+        run: |
+          poetry lock
+          if ! git diff --quiet --ignore-matching-lines='^#' -- poetry.lock; then
+            echo "::error file=autogpt_platform/backend/poetry.lock::poetry.lock is out of date; run poetry lock and commit the result."
+            git diff --ignore-matching-lines='^#' -- poetry.lock || true
+            exit 1
+          fi
+
+      - name: Install project dependencies
+        run: poetry install --no-interaction
+
+      - name: Generate Prisma client and type stubs
+        run: |
+          poetry run prisma generate
+          poetry run gen-prisma-stub
+
+      - name: Start RabbitMQ
+        run: |
+          docker run -d \
+            --name rabbitmq \
+            --hostname rabbitmq \
+            -p 5672:5672 \
+            -e RABBITMQ_DEFAULT_USER="${RABBITMQ_DEFAULT_USER}" \
+            -e RABBITMQ_DEFAULT_PASS="${RABBITMQ_DEFAULT_PASS}" \
+            rabbitmq:4.1.4
+          for attempt in $(seq 1 60); do
+            if docker exec rabbitmq rabbitmq-diagnostics -q ping; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs rabbitmq
+          exit 1
+
+      - name: Start ClamAV
+        run: |
+          docker run -d \
+            --name clamav \
+            -p 3310:3310 \
+            -e CLAMAV_NO_FRESHCLAMD=false \
+            -e CLAMD_CONF_StreamMaxLength=50M \
+            -e CLAMD_CONF_MaxFileSize=100M \
+            -e CLAMD_CONF_MaxScanSize=100M \
+            -e CLAMD_CONF_MaxThreads=12 \
+            -e CLAMD_CONF_ReadTimeout=300 \
+            -e CLAMD_CONF_TCPAddr=0.0.0.0 \
+            clamav/clamav-debian:latest
+
+      - name: Start FalkorDB with authentication
+        run: |
+          docker run -d \
+            --name falkordb \
+            -p 6380:6379 \
+            -e REDIS_ARGS="--requirepass ${GRAPHITI_FALKORDB_PASSWORD}" \
+            falkordb/falkordb:v4.10.0
+          for attempt in $(seq 1 60); do
+            if docker exec falkordb redis-cli -p 6379 -a "${GRAPHITI_FALKORDB_PASSWORD}" --no-auth-warning ping 2>/dev/null | grep -q PONG; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs falkordb
+          exit 1
+
+      - name: Start three-shard Redis cluster
+        run: |
+          docker network create redis-cluster-net
+          for i in 0 1 2; do
+            port=$((17000 + i))
+            bus_port=$((27000 + i))
+            docker run -d \
+              --name "redis-${i}" \
+              --hostname "redis-${i}" \
+              --network redis-cluster-net \
+              -p "${port}:${port}" \
+              redis:7 \
+              redis-server \
+              --port "${port}" \
+              --cluster-enabled yes \
+              --cluster-config-file nodes.conf \
+              --cluster-node-timeout 5000 \
+              --cluster-require-full-coverage no \
+              --cluster-announce-hostname "redis-${i}" \
+              --cluster-announce-port "${port}" \
+              --cluster-announce-bus-port "${bus_port}" \
+              --cluster-preferred-endpoint-type hostname
+          done
+          for i in 0 1 2; do
+            port=$((17000 + i))
+            ready=false
+            for attempt in $(seq 1 60); do
+              if docker exec "redis-${i}" redis-cli -p "${port}" ping 2>/dev/null | grep -q PONG; then
+                ready=true
+                break
+              fi
+              sleep 2
+            done
+            if [[ "${ready}" != "true" ]]; then
+              docker logs "redis-${i}"
+              exit 1
+            fi
+          done
+          docker run --rm --network redis-cluster-net redis:7 \
+            redis-cli --cluster create \
+            redis-0:17000 redis-1:17001 redis-2:17002 \
+            --cluster-replicas 0 --cluster-yes
+          for attempt in $(seq 1 60); do
+            state="$(docker exec redis-0 redis-cli -p 17000 cluster info 2>/dev/null | grep '^cluster_state:' || true)"
+            echo "${state}"
+            if echo "${state}" | grep -q 'cluster_state:ok'; then
+              exit 0
+            fi
+            sleep 2
+          done
+          for i in 0 1 2; do
+            echo "===== redis-${i} logs ====="
+            docker logs "redis-${i}"
+            echo "===== redis-${i} cluster nodes ====="
+            docker exec "redis-${i}" redis-cli -p "$((17000 + i))" cluster nodes || true
+          done
+          exit 1
+
+      - name: Initialize and start local Supabase
+        run: |
+          supabase init --force
+          supabase start --exclude studio,imgproxy,logflare,vector,postgres-meta
+          supabase status -o env > "${RUNNER_TEMP}/supabase.env"
+          set -a
+          # shellcheck disable=SC1091
+          source "${RUNNER_TEMP}/supabase.env"
+          set +a
+          SUPABASE_DB_URL="${DB_URL:-${DATABASE_URL:-}}"
+          if [[ -z "${SUPABASE_DB_URL}" || -z "${API_URL:-}" || -z "${SERVICE_ROLE_KEY:-}" || -z "${JWT_SECRET:-}" ]]; then
+            echo "::error::Supabase did not expose the database URL, API URL, service role key, and JWT secret."
+            supabase status
+            exit 1
+          fi
+          case "${SUPABASE_DB_URL}" in
+            *\?*) DATABASE_URL_WITH_SCHEMA="${SUPABASE_DB_URL}&schema=platform" ;;
+            *) DATABASE_URL_WITH_SCHEMA="${SUPABASE_DB_URL}?schema=platform" ;;
+          esac
+          {
+            echo "DATABASE_URL=${DATABASE_URL_WITH_SCHEMA}"
+            echo "DIRECT_URL=${DATABASE_URL_WITH_SCHEMA}"
+            echo "SUPABASE_URL=${API_URL}"
+            echo "SUPABASE_SERVICE_ROLE_KEY=${SERVICE_ROLE_KEY}"
+            echo "JWT_VERIFY_KEY=${JWT_SECRET}"
+            echo "SUPABASE_JWT_SECRET=${JWT_SECRET}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Wait for ClamAV readiness
+        run: |
+          ready=false
+          for attempt in $(seq 1 150); do
+            if nc -z 127.0.0.1 3310; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [[ "${ready}" != "true" ]]; then
+            echo "::error::ClamAV port 3310 did not become reachable."
+            docker logs clamav
+            exit 1
+          fi
+          if ! docker exec clamav clamdscan --ping 1; then
+            echo "::error::ClamAV readiness probe failed."
+            docker logs clamav
+            exit 1
+          fi
+
+      - name: Deploy Prisma database migrations
+        run: poetry run prisma migrate deploy
+
+      - name: Run backend tests with coverage
+        run: |
+          PYTEST_ARGS=(backend --cov=backend --cov-branch --cov-report=term-missing --cov-report=xml:coverage.xml)
+          if [[ "${{ runner.debug }}" == "1" ]]; then
+            PYTEST_ARGS+=(-vv --log-cli-level=DEBUG)
+          fi
+          poetry run pytest "${PYTEST_ARGS[@]}"
+
+      - name: Upload backend coverage to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./autogpt_platform/backend/coverage.xml
+          flags: platform-backend
+          fail_ci_if_error: false
