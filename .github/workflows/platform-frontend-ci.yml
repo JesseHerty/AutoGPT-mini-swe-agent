@@ -1,0 +1,147 @@
+name: AutoGPT Platform - Frontend CI
+
+on:
+  push:
+    branches: [master, dev]
+    paths:
+      - ".github/workflows/platform-frontend-ci.yml"
+      - "autogpt_platform/frontend/**"
+      - "autogpt_platform/backend/Dockerfile"
+      - "autogpt_platform/docker-compose.yml"
+      - "autogpt_platform/docker-compose.platform.yml"
+  pull_request:
+    paths:
+      - ".github/workflows/platform-frontend-ci.yml"
+      - "autogpt_platform/frontend/**"
+      - "autogpt_platform/backend/Dockerfile"
+      - "autogpt_platform/docker-compose.yml"
+      - "autogpt_platform/docker-compose.platform.yml"
+  merge_group:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'merge_group' && format('merge-queue-{0}', github.ref) || format('{0}-{1}', github.ref, github.event.pull_request.number || github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+    working-directory: autogpt_platform/frontend
+
+
+jobs:
+  setup:
+    name: Prepare frontend CI environment
+    runs-on: ubuntu-latest
+    outputs:
+      components_changed: "${{ steps.components.outputs.components }}"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Detect frontend component changes
+        id: components
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            components:
+              - 'autogpt_platform/frontend/src/components/**'
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10.20.0"
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: autogpt_platform/frontend/pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+  lint:
+    name: Lint frontend code
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10.20.0"
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: autogpt_platform/frontend/pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run frontend lint
+        run: pnpm lint
+
+  chromatic:
+    name: Publish changed components to Chromatic (disabled)
+    needs: setup
+    if: ${{ false && github.ref == 'refs/heads/dev' && needs.setup.outputs.components_changed == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10.20.0"
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: autogpt_platform/frontend/pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Publish changed components to Chromatic
+        uses: chromaui/action@latest
+        with:
+          projectToken: ${{ secrets.CHROMATIC_PROJECT_TOKEN }}
+          workingDir: autogpt_platform/frontend
+          onlyChanged: true
+          exitOnceUploaded: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  integration_test:
+    name: Run frontend unit tests
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10.20.0"
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: autogpt_platform/frontend/pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Generate API client
+        run: pnpm generate:api
+      - name: Run frontend unit tests
+        run: pnpm test:unit
+      - name: Upload frontend coverage to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: autogpt_platform/frontend/coverage/cobertura-coverage.xml
+          flags: platform-frontend
+          fail_ci_if_error: false
