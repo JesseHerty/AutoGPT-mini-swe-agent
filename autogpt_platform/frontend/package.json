@@ -85,7 +85,7 @@
     "cookie": "1.0.2",
     "date-fns": "4.1.0",
     "dexie": "4.2.1",
-    "dotenv": "17.2.3",
+    "dotenv": "18.0.10",
     "elliptic": "6.6.1",
     "embla-carousel-react": "8.6.0",
     "flatbush": "4.5.0",
